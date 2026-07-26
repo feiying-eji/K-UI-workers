@@ -480,17 +480,24 @@ def get_http_ping(url):
     except: return "0"
 
 def get_net_dev_bytes():
-    rx = tx = 0
     try:
-        with open('/proc/net/dev') as f:
-            lines = f.readlines()[2:]
-            for line in lines:
-                parts = line.split()
-                if parts[0] != 'lo:':
-                    rx += int(parts[1])
-                    tx += int(parts[9])
+        # Count only the default-route interface. Summing every non-loopback
+        # device double-counts forwarded packets on tunnels, bridges and veths.
+        route = subprocess.run(
+            ["ip", "-o", "route", "show", "default"],
+            capture_output=True, text=True, timeout=3, check=True
+        ).stdout
+        match = re.search(r'\bdev\s+(\S+)', route)
+        if not match:
+            return 0, 0
+        interface = match.group(1)
+        with open(f'/sys/class/net/{interface}/statistics/rx_bytes') as f:
+            rx = int(f.read().strip())
+        with open(f'/sys/class/net/{interface}/statistics/tx_bytes') as f:
+            tx = int(f.read().strip())
+        return rx, tx
     except: pass
-    return rx, tx
+    return 0, 0
 
 def ensure_firewall_open(port, transport=None):
     # 验证端口参数
