@@ -17,7 +17,7 @@ async function hmacHex(secret, message) {
 function bytesEqual(left, right) { if (left.length !== right.length) return false; let diff = 0; for (let i = 0; i < left.length; i++) diff |= left[i] ^ right[i]; return diff === 0; }
 function base64Bytes(bytes) { let output = ''; for (const byte of bytes) output += String.fromCharCode(byte); return btoa(output); }
 function decodeBase64Bytes(value) { const binary = atob(value); return Uint8Array.from(binary, char => char.charCodeAt(0)); }
-async function passwordHash(password, salt = crypto.getRandomValues(new Uint8Array(16)), iterations = 210000) { const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']); const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, 256); return `pbkdf2$${iterations}$${base64Bytes(salt)}$${base64Bytes(new Uint8Array(bits))}`; }
+async function passwordHash(password, salt = crypto.getRandomValues(new Uint8Array(16)), iterations = 100000) { const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']); const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, 256); return `pbkdf2$${iterations}$${base64Bytes(salt)}$${base64Bytes(new Uint8Array(bits))}`; }
 async function passwordMatches(password, stored) { try { if (/^[0-9a-f]{64}$/i.test(stored || '')) return bytesEqual(new TextEncoder().encode(await sha256(password)), new TextEncoder().encode(stored.toLowerCase())); const [kind, rawIterations, rawSalt, rawHash] = String(stored || '').split('$'); if (kind !== 'pbkdf2') return false; const iterations = Number(rawIterations); if (!Number.isInteger(iterations) || iterations < 100000 || iterations > 1000000) return false; const salt = decodeBase64Bytes(rawSalt); const expected = decodeBase64Bytes(rawHash); const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']); const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, expected.byteLength * 8); return bytesEqual(new Uint8Array(bits), expected); } catch { return false; } }
 async function sessionToken() { const bytes = crypto.getRandomValues(new Uint8Array(32)); return base64Bytes(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, ''); }
 
@@ -498,7 +498,12 @@ async function initializeDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS report_receipts (report_id TEXT PRIMARY KEY, vps_ip TEXT NOT NULL, created_at INTEGER NOT NULL, applied INTEGER DEFAULT 1)`,
         `CREATE TABLE IF NOT EXISTS auth_replays (nonce TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL)`,
         `CREATE TABLE IF NOT EXISTS login_throttles (key TEXT PRIMARY KEY, failures INTEGER NOT NULL, window_started_at INTEGER NOT NULL, blocked_until INTEGER NOT NULL DEFAULT 0)`,
-        `CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL)`
+        `CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires_at INTEGER NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS user_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL)`,
+        `CREATE TABLE IF NOT EXISTS user_group_members (group_id TEXT NOT NULL, username TEXT NOT NULL, PRIMARY KEY(group_id, username), FOREIGN KEY(group_id) REFERENCES user_groups(id) ON DELETE CASCADE, FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE)`,
+        `CREATE TABLE IF NOT EXISTS user_group_resources (group_id TEXT NOT NULL, resource_type TEXT NOT NULL CHECK(resource_type IN ('vps', 'node')), resource_id TEXT NOT NULL, PRIMARY KEY(group_id, resource_type, resource_id), FOREIGN KEY(group_id) REFERENCES user_groups(id) ON DELETE CASCADE)`,
+        `CREATE INDEX IF NOT EXISTS idx_group_members_user ON user_group_members(username)`,
+        `CREATE INDEX IF NOT EXISTS idx_group_resources_resource ON user_group_resources(resource_type, resource_id)`
     ];
     for (let query of initQueries) { try { await db.prepare(query).run(); } catch (e) {} }
     try { await db.prepare("ALTER TABLE nodes ADD COLUMN network TEXT DEFAULT 'tcp'").run(); } catch (e) {}
@@ -1319,8 +1324,8 @@ export async function onRequest(context) {
             sqlParams.push(adminUser); 
             if (ip) { query += " AND vps_ip = ?"; sqlParams.push(ip); } 
         } else { 
-            query = `SELECT n.* FROM nodes n JOIN users u ON n.username = u.username WHERE n.enable = 1 AND (n.traffic_limit = 0 OR n.traffic_used < n.traffic_limit) AND (n.expire_time = 0 OR n.expire_time > ?) AND n.username = ? AND u.enable = 1 AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) AND (u.expire_time = 0 OR u.expire_time > ?)`; 
-            sqlParams.push(reqUser, now); 
+            query = `SELECT DISTINCT n.* FROM nodes n JOIN users u ON u.username = ? WHERE n.enable = 1 AND (n.traffic_limit = 0 OR n.traffic_used < n.traffic_limit) AND (n.expire_time = 0 OR n.expire_time > ?) AND u.enable = 1 AND (u.traffic_limit = 0 OR u.traffic_used < u.traffic_limit) AND (u.expire_time = 0 OR u.expire_time > ?) AND (n.username = u.username OR EXISTS (SELECT 1 FROM user_group_members gm JOIN user_group_resources gr ON gr.group_id = gm.group_id WHERE gm.username = u.username AND ((gr.resource_type = 'node' AND gr.resource_id = n.id) OR (gr.resource_type = 'vps' AND gr.resource_id = n.vps_ip))))`;
+            sqlParams = [reqUser, now, now];
             if (ip) { query += " AND n.vps_ip = ?"; sqlParams.push(ip); } 
         }
         
@@ -1584,8 +1589,9 @@ rules:
                     }
                 }
             }
-            const nodes = isAdmin ? (await db.prepare("SELECT * FROM nodes").all()).results : (await db.prepare("SELECT * FROM nodes WHERE username = ?").bind(currentUser).all()).results;
+            const nodes = isAdmin ? (await db.prepare("SELECT * FROM nodes").all()).results : (await db.prepare("SELECT DISTINCT n.* FROM nodes n WHERE n.username = ? OR EXISTS (SELECT 1 FROM user_group_members gm JOIN user_group_resources gr ON gr.group_id = gm.group_id WHERE gm.username = ? AND ((gr.resource_type = 'node' AND gr.resource_id = n.id) OR (gr.resource_type = 'vps' AND gr.resource_id = n.vps_ip)))").bind(currentUser, currentUser).all()).results;
             const users = isAdmin ? (await db.prepare("SELECT * FROM users").all()).results : (await db.prepare("SELECT * FROM users WHERE username = ?").bind(currentUser).all()).results;
+            const groups = isAdmin ? (await db.prepare("SELECT g.*, COALESCE((SELECT json_group_array(username) FROM user_group_members WHERE group_id = g.id), '[]') AS members, COALESCE((SELECT json_group_array(json_object('type', resource_type, 'id', resource_id)) FROM user_group_resources WHERE group_id = g.id), '[]') AS resources FROM user_groups g ORDER BY g.name").all()).results : [];
             let siteTitle = "Cluster Gateway"; try { const r = await db.prepare("SELECT val FROM sys_config WHERE key='site_title'").first(); if(r && r.val) siteTitle = r.val; } catch(e){}
             let mySubToken = "";
             if (isAdmin) {
@@ -1597,7 +1603,7 @@ rules:
             }
             else { const u = await db.prepare("SELECT sub_token FROM users WHERE username = ?").bind(currentUser).first(); if(u && u.sub_token) mySubToken = u.sub_token; }
             const realtime = await db.prepare("SELECT val FROM sys_config WHERE key = 'realtime_url'").first();
-            return Response.json({ servers, nodes, users, siteTitle, mySubToken, realtimeUrl: env.REALTIME_URL || realtime && realtime.val || '' });
+            return Response.json({ servers, nodes, users, groups, siteTitle, mySubToken, realtimeUrl: env.REALTIME_URL || realtime && realtime.val || '' });
         }
         
         if (action === "settings" && method === "POST" && isAdmin) {
@@ -1620,7 +1626,49 @@ rules:
         if (action === "users" && isAdmin) {
             if (method === "POST") { const { username, password, traffic_limit, expire_time } = await readJsonBody(request, 16 * 1024); const safeUser = String(username || '').trim(); if (!/^[A-Za-z0-9_.-]{1,64}$/.test(safeUser) || safeUser === (env.ADMIN_USERNAME || 'admin')) return Response.json({ error: 'Invalid or reserved username' }, { status: 400 }); if (String(password || '').length < 12) return Response.json({ error: 'Password must be at least 12 characters' }, { status: 400 }); if (await db.prepare("SELECT username FROM users WHERE username = ?").bind(safeUser).first()) return Response.json({ error: "User already exists" }, { status: 409 }); const hash = await passwordHash(password); const subToken = crypto.randomUUID(); await db.prepare("INSERT INTO users (username, password, traffic_limit, expire_time, sub_token) VALUES (?, ?, ?, ?, ?)").bind(safeUser, hash, Math.max(0, Number(traffic_limit)||0), Math.max(0, Number(expire_time)||0), subToken).run(); return Response.json({ success: true }); }
             if (method === "PUT") { const { username, enable, reset_traffic } = await request.json(); const statements = []; if (reset_traffic) statements.push(db.prepare("UPDATE users SET traffic_used = 0 WHERE username = ?").bind(username)); if (enable !== undefined) statements.push(db.prepare("UPDATE users SET enable = ? WHERE username = ?").bind(enable, username)); if (statements.length) await db.batch(statements); return Response.json({ success: true }); }
-            if (method === "DELETE") { const target = new URL(request.url).searchParams.get("username"); await db.prepare("DELETE FROM users WHERE username = ?").bind(target).run(); await db.prepare("UPDATE nodes SET username = ? WHERE username = ?").bind(currentUser, target).run(); return Response.json({ success: true }); }
+            if (method === "DELETE") { const target = new URL(request.url).searchParams.get("username"); await db.batch([db.prepare("DELETE FROM user_group_members WHERE username = ?").bind(target), db.prepare("DELETE FROM users WHERE username = ?").bind(target), db.prepare("UPDATE nodes SET username = ? WHERE username = ?").bind(currentUser, target)]); return Response.json({ success: true }); }
+        }
+
+        if (action === "groups" && isAdmin) {
+            if (method === "POST") {
+                const data = await readJsonBody(request, 32 * 1024);
+                const name = String(data.name || '').trim();
+                if (!name || name.length > 64) return Response.json({ error: 'Group name must be 1-64 characters' }, { status: 400 });
+                if (await db.prepare("SELECT id FROM user_groups WHERE name = ?").bind(name).first()) return Response.json({ error: 'Group already exists' }, { status: 409 });
+                await db.prepare("INSERT INTO user_groups (id, name, created_at) VALUES (?, ?, ?)").bind(crypto.randomUUID(), name, Date.now()).run();
+                return Response.json({ success: true });
+            }
+            if (method === "PUT") {
+                const data = await readJsonBody(request, 64 * 1024);
+                const groupId = String(data.id || '');
+                const group = await db.prepare("SELECT id FROM user_groups WHERE id = ?").bind(groupId).first();
+                if (!group) return Response.json({ error: 'Group not found' }, { status: 404 });
+                const members = Array.isArray(data.members) ? [...new Set(data.members.map(value => String(value)))].slice(0, 200) : null;
+                const resources = Array.isArray(data.resources) ? data.resources.slice(0, 300) : null;
+                const statements = [];
+                if (members) {
+                    for (const username of members) if (!await db.prepare("SELECT username FROM users WHERE username = ?").bind(username).first()) return Response.json({ error: `User not found: ${username}` }, { status: 400 });
+                    statements.push(db.prepare("DELETE FROM user_group_members WHERE group_id = ?").bind(groupId));
+                    statements.push(...members.map(username => db.prepare("INSERT INTO user_group_members (group_id, username) VALUES (?, ?)").bind(groupId, username)));
+                }
+                if (resources) {
+                    const normalized = [];
+                    for (const item of resources) {
+                        const type = item?.type === 'vps' ? 'vps' : item?.type === 'node' ? 'node' : '';
+                        const id = String(item?.id || '');
+                        if (!type || !id) return Response.json({ error: 'Invalid group resource' }, { status: 400 });
+                        const exists = type === 'vps' ? await db.prepare("SELECT ip FROM servers WHERE ip = ?").bind(id).first() : await db.prepare("SELECT id FROM nodes WHERE id = ?").bind(id).first();
+                        if (!exists) return Response.json({ error: `${type} resource not found` }, { status: 400 });
+                        if (!normalized.some(resource => resource.type === type && resource.id === id)) normalized.push({ type, id });
+                    }
+                    statements.push(db.prepare("DELETE FROM user_group_resources WHERE group_id = ?").bind(groupId));
+                    statements.push(...normalized.map(resource => db.prepare("INSERT INTO user_group_resources (group_id, resource_type, resource_id) VALUES (?, ?, ?)").bind(groupId, resource.type, resource.id)));
+                }
+                if (!statements.length) return Response.json({ error: 'No group changes supplied' }, { status: 400 });
+                await db.batch(statements);
+                return Response.json({ success: true });
+            }
+            if (method === "DELETE") { const id = new URL(request.url).searchParams.get("id"); await db.batch([db.prepare("DELETE FROM user_group_members WHERE group_id = ?").bind(id), db.prepare("DELETE FROM user_group_resources WHERE group_id = ?").bind(id), db.prepare("DELETE FROM user_groups WHERE id = ?").bind(id)]); return Response.json({ success: true }); }
         }
         
         if (action === "vps" && isAdmin) {
@@ -1629,7 +1677,7 @@ rules:
             if (method === "PUT") { const data = await request.json(); const ip = data.ip; if (!ip) return Response.json({ error: 'IP required' }, { status: 400 }); if (data.egress_mode === undefined) return Response.json({ error: 'Use egress_mode to configure node egress' }, { status: 400 }); const modes = ['native', 'residential', 'warp_ipv4', 'warp_ipv6', 'warp_dual', 'socks5']; if (!modes.includes(data.egress_mode)) return Response.json({ error: 'Invalid egress mode' }, { status: 400 }); if (data.egress_mode === 'residential' && env.PROXY_CTRL_URL) return Response.json({ error: '外部住宅控制器模式不支持本机住宅节点出口' }, { status: 409 }); if (data.egress_mode === 'residential' && (!env.PROXY_USER || !env.PROXY_PASS)) return Response.json({ error: 'Pages 未配置住宅代理凭据' }, { status: 503 }); const proxyMode = data.proxy_mode === 'selective' ? 'selective' : 'global'; const proxyCategories = data.proxy_categories ? String(data.proxy_categories) : ''; const socks5Addr = String(data.socks5_addr || '').slice(0, 128); const socks5Port = Math.min(65535, Math.max(1, Number(data.socks5_port) || 0)); const socks5User = String(data.socks5_user || '').slice(0, 64); const socks5Pass = String(data.socks5_pass || '').slice(0, 128); let changed; if (data.egress_mode === 'socks5' && socks5Addr && socks5Port) { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ?, socks5_addr = ?, socks5_port = ?, socks5_user = ?, socks5_pass = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, socks5Addr, socks5Port, socks5User, socks5Pass, ip).first(); } else { changed = await db.prepare("UPDATE servers SET egress_mode = ?, egress_revision = egress_revision + 1, egress_status = 'pending', egress_error = '', proxy_mode = ?, proxy_categories = ? WHERE ip = ? RETURNING egress_revision").bind(data.egress_mode, proxyMode, proxyCategories, ip).first(); } if (!changed) return Response.json({ error: 'VPS not found' }, { status: 404 }); context.waitUntil(notifyRealtimeVps(env, db, ip).catch(() => {})); return Response.json({ success: true, ip, egress_mode: data.egress_mode, egress_revision: Number(changed.egress_revision), egress_status: 'pending', proxy_mode: proxyMode, proxy_categories: proxyCategories, socks5_addr: data.egress_mode === 'socks5' ? socks5Addr : '', socks5_port: data.egress_mode === 'socks5' ? socks5Port : 0 }); }
             if (method === "DELETE") { 
                 const ip = new URL(request.url).searchParams.get("ip"); 
-                await db.batch([ db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip), db.prepare("DELETE FROM proxy_ctrl_servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM server_logs WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`) ]);
+                await db.batch([ db.prepare("DELETE FROM user_group_resources WHERE resource_type = 'vps' AND resource_id = ?").bind(ip), db.prepare("DELETE FROM user_group_resources WHERE resource_type = 'node' AND resource_id IN (SELECT id FROM nodes WHERE vps_ip = ?)").bind(ip), db.prepare("DELETE FROM nodes WHERE vps_ip = ?").bind(ip), db.prepare("DELETE FROM traffic_stats WHERE ip = ?").bind(ip), db.prepare("DELETE FROM servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_servers WHERE id = ?").bind(ip), db.prepare("DELETE FROM proxy_ctrl_servers WHERE ip = ?").bind(ip), db.prepare("DELETE FROM server_logs WHERE ip = ?").bind(ip), db.prepare("DELETE FROM probe_settings WHERE key = ?").bind(`proxy_slot_map_${ip}`) ]);
                 return Response.json({ success: true }); 
             }
         }
@@ -1637,7 +1685,7 @@ rules:
         if (action === "nodes" && isAdmin) {
             if (method === "POST") { const n = await request.json(); const protocols = ['VLESS','XTLS-Reality','Reality','Hysteria2','TUIC','Trojan','H2-Reality','gRPC-Reality','AnyTLS','Naive','Socks5','VLESS-Argo','dokodemo-door']; if (!/^[A-Za-z0-9_-]{1,64}$/.test(String(n.id || ''))) return Response.json({ error: 'Invalid node id' }, { status: 400 }); if (!protocols.includes(n.protocol)) return Response.json({ error: 'Invalid protocol' }, { status: 400 }); if (!Number.isInteger(Number(n.port)) || Number(n.port) < 1 || Number(n.port) > 65535) return Response.json({ error: 'Invalid port' }, { status: 400 }); if (!(await db.prepare('SELECT ip FROM servers WHERE ip = ?').bind(n.vps_ip).first())) return Response.json({ error: 'VPS not found' }, { status: 404 }); if (n.protocol === 'dokodemo-door') { if (!['internal','external'].includes(n.relay_type)) return Response.json({error:'Invalid relay type'},{status:400}); if (n.relay_type === 'external' && (!String(n.target_ip||'').trim() || !Number.isInteger(Number(n.target_port)) || Number(n.target_port)<1 || Number(n.target_port)>65535)) return Response.json({error:'Invalid relay target'},{status:400}); if (n.relay_type === 'internal' && !(await db.prepare('SELECT id FROM nodes WHERE id = ? AND vps_ip = ?').bind(n.target_id,n.vps_ip).first())) return Response.json({error:'Internal relay target not found on VPS'},{status:400}); } if (await db.prepare("SELECT id FROM nodes WHERE id = ?").bind(n.id).first()) return Response.json({ error: "Node already exists" }, { status: 409 }); let nodeUser = n.username || currentUser; if (nodeUser === 'admin') nodeUser = currentUser; await db.prepare(`INSERT INTO nodes (id, uuid, vps_ip, protocol, port, sni, private_key, public_key, short_id, relay_type, target_ip, target_port, target_id, enable, traffic_used, traffic_limit, expire_time, username, network) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(n.id, n.uuid, n.vps_ip, n.protocol, Number(n.port), n.sni||null, n.private_key||null, n.public_key||null, n.short_id||null, n.relay_type||null, n.target_ip||null, n.target_port||null, n.target_id||null, 1, 0, Math.max(0, Number(n.traffic_limit)||0), Math.max(0, Number(n.expire_time)||0), nodeUser, n.network||'tcp').run(); context.waitUntil(notifyRealtimeVps(env, db, n.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
             if (method === "PUT") { const { id, enable, reset_traffic } = await request.json(); const node = await db.prepare('SELECT vps_ip FROM nodes WHERE id = ?').bind(id).first(); if (!node) return Response.json({ error: 'Node not found' }, { status: 404 }); const statements = []; if (reset_traffic) statements.push(db.prepare("UPDATE nodes SET traffic_used = 0 WHERE id = ?").bind(id)); if (enable !== undefined) statements.push(db.prepare("UPDATE nodes SET enable = ? WHERE id = ?").bind(enable ? 1 : 0, id)); if (statements.length) await db.batch(statements); context.waitUntil(notifyRealtimeVps(env, db, node.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
-            if (method === "DELETE") { const id = new URL(request.url).searchParams.get("id"); const node = await db.prepare('SELECT vps_ip FROM nodes WHERE id = ?').bind(id).first(); await db.prepare("DELETE FROM nodes WHERE id = ?").bind(id).run(); if (node) context.waitUntil(notifyRealtimeVps(env, db, node.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
+            if (method === "DELETE") { const id = new URL(request.url).searchParams.get("id"); const node = await db.prepare('SELECT vps_ip FROM nodes WHERE id = ?').bind(id).first(); await db.batch([db.prepare("DELETE FROM user_group_resources WHERE resource_type = 'node' AND resource_id = ?").bind(id), db.prepare("DELETE FROM nodes WHERE id = ?").bind(id)]); if (node) context.waitUntil(notifyRealtimeVps(env, db, node.vps_ip).catch(()=>{})); return Response.json({ success: true }); }
         }
 
     if (action === "thirdparty" && isAdmin) {

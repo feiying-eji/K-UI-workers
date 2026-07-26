@@ -387,7 +387,7 @@
                 <div class="kui-tab-strip w-full max-w-full overflow-x-auto bg-slate-200/50 p-1.5 rounded-full flex flex-nowrap justify-start lg:justify-center gap-1 backdrop-blur-sm border border-white/50 shadow-inner">
                     <template v-if="role === 'admin'">
                         <button @click="activeTab = 'nodes'" :class="activeTab === 'nodes' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'" class="kui-tab-button kui-admin-tab shrink-0 whitespace-nowrap px-2 sm:px-3 lg:px-4 py-2 sm:py-2.5 rounded-full font-bold transition-all text-[11px] sm:text-xs lg:text-sm">服务器与节点</button>
-                        <button @click="activeTab = 'users'" :class="activeTab === 'users' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'" class="kui-tab-button kui-admin-tab shrink-0 whitespace-nowrap px-2 sm:px-3 lg:px-4 py-2 sm:py-2.5 rounded-full font-bold transition-all text-[11px] sm:text-xs lg:text-sm">多用户管理</button>
+                        <button @click="activeTab = 'users'" :class="activeTab === 'users' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'" class="kui-tab-button kui-admin-tab shrink-0 whitespace-nowrap px-2 sm:px-3 lg:px-4 py-2 sm:py-2.5 rounded-full font-bold transition-all text-[11px] sm:text-xs lg:text-sm">用户与授权</button>
                         <button @click="activeTab = 'proxy'" :class="activeTab === 'proxy' ? 'bg-white text-purple-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'" class="kui-tab-button kui-admin-tab shrink-0 whitespace-nowrap px-2 sm:px-3 lg:px-4 py-2 sm:py-2.5 rounded-full font-bold transition-all text-[11px] sm:text-xs lg:text-sm">🌐 住宅IP代理</button>
                         <button @click="activeTab = 'realm'" :class="activeTab === 'realm' ? 'bg-white text-cyan-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'" class="kui-tab-button kui-admin-tab shrink-0 whitespace-nowrap px-2 sm:px-3 lg:px-4 py-2 sm:py-2.5 rounded-full font-bold transition-all text-[11px] sm:text-xs lg:text-sm">🔀 Realm中转</button>
                         <button @click="activeTab = 'services'" :class="activeTab === 'services' ? 'bg-white text-violet-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'" class="kui-tab-button kui-admin-tab shrink-0 whitespace-nowrap px-2 sm:px-3 lg:px-4 py-2 sm:py-2.5 rounded-full font-bold transition-all text-[11px] sm:text-xs lg:text-sm">🧩 第三方服务</button>
@@ -573,6 +573,23 @@
                         <div class="w-full bg-slate-100 rounded-full h-2.5 mb-3 overflow-hidden shadow-inner"><div :class="(u.traffic_limit > 0 && u.traffic_used >= u.traffic_limit) ? 'bg-rose-500' : 'bg-gradient-to-r from-blue-400 to-indigo-500'" class="h-2.5 rounded-full" :style="{ width: getTrafficPercent(u.traffic_used, u.traffic_limit) + '%' }"></div></div>
                         <button v-if="u.traffic_used > 0" @click="resetUserTraffic(u.username)" class="text-[11px] text-indigo-500 font-bold hover:underline">重置流量</button>
                     </div>
+                </div>
+            </div>
+
+            <div v-if="role === 'admin' && activeTab === 'users'" class="space-y-6 pt-4 border-t border-slate-200/70">
+                <div class="bg-indigo-50 border border-indigo-100 p-5 rounded-2xl text-sm text-indigo-800 font-medium">用户组可把整台 VPS 或单个节点授权给多个用户。用户订阅会自动合并其所属全部组的授权资源；未加入任何组的旧用户仍按原有“节点归属”规则工作。</div>
+                <div class="bg-white/70 backdrop-blur-xl p-6 rounded-[2rem] border border-white shadow-xl flex flex-col md:flex-row gap-4 items-end">
+                    <div class="flex-1 w-full"><label class="block text-xs font-bold text-slate-400 mb-2 pl-2">新用户组名称</label><input v-model="newGroupName" maxlength="64" placeholder="例如：流媒体组 / 商务组" class="w-full bg-white border border-slate-100 p-3 rounded-2xl outline-none"></div>
+                    <button @click="addGroup" class="w-full md:w-auto bg-slate-800 text-white px-8 py-3 rounded-2xl font-bold hover:bg-black">创建用户组</button>
+                </div>
+                <div v-if="groups.length === 0" class="text-center py-12 text-slate-400 font-medium border-2 border-dashed border-slate-200 rounded-3xl">尚未创建用户组</div>
+                <div v-for="group in groups" :key="group.id" class="bg-white/70 backdrop-blur-xl p-6 rounded-[2rem] border border-white shadow-xl space-y-5">
+                    <div class="flex justify-between gap-4 items-center"><div><h3 class="text-xl font-black text-slate-800">{{ group.name }}</h3><p class="text-xs text-slate-400 mt-1">成员 {{ groupDraft(group).members.length }} 人 · 已授权 {{ groupDraft(group).resources.length }} 项资源</p></div><button @click="deleteGroup(group)" class="text-rose-500 bg-rose-50 px-3 py-2 rounded-xl text-xs font-bold">删除用户组</button></div>
+                    <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                        <div><label class="block text-xs font-bold text-slate-500 mb-2">组成员</label><select multiple v-model="groupDraft(group).members" class="w-full h-36 bg-slate-50 border border-slate-100 rounded-xl p-3 text-sm outline-none"><option v-for="u in users" :key="u.username" :value="u.username">{{ u.username }}</option></select><p class="text-[10px] text-slate-400 mt-1">按 Ctrl / Command 多选</p></div>
+                        <div><label class="block text-xs font-bold text-slate-500 mb-2">可用资源</label><select multiple v-model="groupDraft(group).resources" class="w-full h-36 bg-slate-50 border border-slate-100 rounded-xl p-3 text-sm outline-none"><optgroup label="整台 VPS（包含该机所有节点）"><option v-for="vps in servers" :key="'vps:'+vps.ip" :value="'vps:'+vps.ip">VPS · {{ vps.name }} ({{ vps.ip }})</option></optgroup><optgroup label="单独节点"><option v-for="node in nodes" :key="'node:'+node.id" :value="'node:'+node.id">节点 · {{ getVpsName(node.vps_ip) }} · {{ node.protocol }}:{{ node.port }}</option></optgroup></select><p class="text-[10px] text-slate-400 mt-1">整机授权与单节点授权可叠加</p></div>
+                    </div>
+                    <div class="flex justify-end"><button @click="saveGroup(group)" class="bg-indigo-600 text-white px-6 py-2.5 rounded-xl text-sm font-bold hover:bg-indigo-700">保存授权</button></div>
                 </div>
             </div>
 
@@ -1041,12 +1058,12 @@
                 const activeTab = ref(localStorage.getItem('monitor_preferred_tab') || 'probe'); 
                 const currentDomain = window.location.origin;
 
-                const servers = ref([]); const nodes = ref([]); const users = ref([]);
+                const servers = ref([]); const nodes = ref([]); const users = ref([]); const groups = ref([]);
                 const realtimeUrl = ref('');
                 const realtimeConnected = ref(false);
                 let realtimeSocket = null; let realtimeReconnectTimer = null; let realtimeFallbackTimer = null; let realtimeConnectTimer = null; let realtimePingTimer = null; let realtimeGeneration = 0; let realtimeDisconnectedAt = 0; let lastRealtimePing = 0; let realtimeRetryDelay = 5000;
                 let publicRealtimeSocket = null; let publicRealtimeReconnectTimer = null; let publicRealtimeFallbackTimer = null; let publicRealtimeConnectTimer = null; let publicRealtimeActivityTimer = null; let publicRealtimeDisconnectedAt = 0; let publicRealtimeRetryDelay = 10000;
-                const newVps = ref({ name: '', ip: '', os: 'debian' }); const newNodeParams = reactive({}); const newUser = reactive({ username: '', password: '', traffic_limit_gb: '', expire_date: '' });
+                const newVps = ref({ name: '', ip: '', os: 'debian' }); const newNodeParams = reactive({}); const newUser = reactive({ username: '', password: '', traffic_limit_gb: '', expire_date: '' }); const newGroupName = ref(''); const groupDrafts = reactive({});
                 const mySubToken = ref(''); const siteTitle = ref(''); const siteTitleInput = ref(''); const userNewPassword = ref('');
                 const batchStartPort = reactive({}); const batchUser = reactive({}); 
                 const thirdPartySubscriptions = ref([]); const newThirdParty = reactive({ name: '', url: '' }); const loadingThirdParty = ref(false);
@@ -1279,7 +1296,7 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                     } catch (e) { alert('登录异常'); }
                 };
                 
-                const clearPrivateState = () => { servers.value = []; nodes.value = []; users.value = []; adminProbeServers.value = []; mySubToken.value = ''; probeDetailId.value = null; probeDetail.value = {}; window.kuiRealtimeProxySnapshots = {}; };
+                const clearPrivateState = () => { servers.value = []; nodes.value = []; users.value = []; groups.value = []; adminProbeServers.value = []; mySubToken.value = ''; probeDetailId.value = null; probeDetail.value = {}; window.kuiRealtimeProxySnapshots = {}; };
                 const logout = () => { authGeneration++; localStorage.removeItem('kui_auth_key'); localStorage.removeItem('kui_user'); localStorage.removeItem('kui_role'); isLoggedIn.value = false; currentUser.value = ''; authKey.value = ''; clearPrivateState(); activeTab.value = 'probe'; realtimeGeneration++; realtimeDisconnectedAt = 0; clearTimeout(realtimeFallbackTimer); clearTimeout(realtimeReconnectTimer); clearTimeout(realtimeConnectTimer); clearInterval(realtimePingTimer); const socket = realtimeSocket; realtimeSocket = null; socket?.close(); realtimeConnected.value = false; window.kuiRealtimeConnected = false; stopPolling(); startProbePolling();};
                 const sendUiPing = async () => { try { await fetchApi('/api/ui_ping', { method: 'POST' }); } catch(e) {} };
 
@@ -1429,7 +1446,7 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                     try {
                         const res = await fetchApi('/api/data'); const data = await res.json();
                         const liveByIp = new Map(servers.value.filter(item => item._realtime_ts).map(item => [normalizeRealtimeKey(item.ip), item]));
-                        servers.value = (data.servers || []).map(item => { const live = liveByIp.get(normalizeRealtimeKey(item.ip)); return live && live._realtime_ts > Number(item.last_report || 0) ? { ...item, ...live } : item; }); nodes.value = data.nodes || []; users.value = data.users || [];
+                        servers.value = (data.servers || []).map(item => { const live = liveByIp.get(normalizeRealtimeKey(item.ip)); return live && live._realtime_ts > Number(item.last_report || 0) ? { ...item, ...live } : item; }); nodes.value = data.nodes || []; users.value = data.users || []; groups.value = (data.groups || []).map(group => { let members = []; let resources = []; try { members = JSON.parse(group.members || '[]'); } catch (e) {} try { resources = JSON.parse(group.resources || '[]'); } catch (e) {} groupDrafts[group.id] = { members: Array.isArray(members) ? members : [], resources: Array.isArray(resources) ? resources.map(resource => `${resource.type}:${resource.id}`) : [] }; return group; });
                         if (data.siteTitle) { siteTitle.value = data.siteTitle; siteTitleInput.value = data.siteTitle; }
                         if (data.mySubToken) mySubToken.value = data.mySubToken;
                         if (data.realtimeUrl && data.realtimeUrl !== realtimeUrl.value) { realtimeUrl.value = data.realtimeUrl; connectRealtime(); }
@@ -1462,6 +1479,10 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
                 const toggleUser = async (username, status) => { await fetchApi('/api/users', { method: 'PUT', body: JSON.stringify({ username, enable: status }) }); refreshData(); };
                 const deleteUser = async (username) => { if(confirm('⚠️ 确定删除用户？节点将归还给管理员。')) { await fetchApi(`/api/users?username=${username}`, { method: 'DELETE' }); refreshData(); } };
                 const resetUserTraffic = async (username) => { await fetchApi('/api/users', { method: 'PUT', body: JSON.stringify({ username, reset_traffic: true }) }); refreshData(); };
+                const groupDraft = group => groupDrafts[group.id] || (groupDrafts[group.id] = { members: [], resources: [] });
+                const addGroup = async () => { const name = newGroupName.value.trim(); if (!name) return alert('请输入用户组名称'); await fetchApi('/api/groups', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name }) }); newGroupName.value = ''; refreshData(); };
+                const saveGroup = async group => { const draft = groupDraft(group); const resources = draft.resources.map(value => { const separator = value.indexOf(':'); return { type: value.slice(0, separator), id: value.slice(separator + 1) }; }).filter(resource => resource.type && resource.id); await fetchApi('/api/groups', { method: 'PUT', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ id: group.id, members: draft.members, resources }) }); refreshData(); };
+                const deleteGroup = async group => { if (confirm(`确定删除用户组“${group.name}”？不会删除其中的用户或节点。`)) { await fetchApi(`/api/groups?id=${encodeURIComponent(group.id)}`, { method: 'DELETE' }); delete groupDrafts[group.id]; refreshData(); } };
                 const addVps = async () => { if(!newVps.value.ip || !newVps.value.name) return alert('请输入名称和IP'); deployOsMap[newVps.value.ip] = newVps.value.os; saveOsMap(); await fetchApi('/api/vps', { method: 'POST', body: JSON.stringify({ ip: newVps.value.ip, name: newVps.value.name }) }); newVps.value = { name: '', ip: '', os: 'debian' }; refreshData(); fetchProbeData();};
                 const deleteVps = async (ip) => { if(confirm('🧨 确定移除该机器？该机器相关的探针数据、节点数据将被完全清空！')) { await fetchApi(`/api/vps?ip=${ip}`, { method: 'DELETE' }); refreshData(); fetchProbeData();} };
                 const egressModeLabel = mode => ({ native: '原生出口', residential: '住宅 IP 代理', warp_ipv4: 'WARP IPv4', warp_ipv6: 'WARP IPv6', warp_dual: 'WARP 双栈', socks5: '手动 SOCKS5' }[mode] || mode);
@@ -1797,8 +1818,8 @@ body.theme11 #app, body.theme13 #app, body.theme14 #app, body.theme15 #app, body
 
                 return { 
                     isLoggedIn, showLoginModal, loginUser, password, currentUser, role, activeTab, 
-                    servers, nodes, users, newVps, newNodeParams, newUser, 
-                    login, logout, refreshData, addUser, toggleUser, deleteUser, resetUserTraffic, addVps, deleteVps, addNode, deleteNode, toggleNode, resetTraffic,
+                    servers, nodes, users, groups, newVps, newNodeParams, newUser, newGroupName,
+                    login, logout, refreshData, addUser, toggleUser, deleteUser, resetUserTraffic, addGroup, saveGroup, deleteGroup, groupDraft, addVps, deleteVps, addNode, deleteNode, toggleNode, resetTraffic,
                     getNodesByIp, getVpsName, formatBytes, formatDate, getExpireText, getTrafficPercent, getPingColor, isOnline, generateCmd, generateSubLink, copyCommand,
                     globalOnline, globalTraffic, globalSpeedIn, globalSpeedOut, deployOsMap, saveOsMap, siteTitle, siteTitleInput, saveSiteTitle, userNewPassword, updateUserPassword, resetMySubLink, generateUUIDForNewUser, batchStartPort, batchUser, deployAllProtocols,
                     probeSys, publicProbeServers, filteredProbeServers, probeView, probeDetailId, probeDetail, setProbeView, openProbeDetail, probeGlobalOnline, probeGlobalOffline, probeGlobalSpeedIn, probeGlobalSpeedOut, probeGlobalNetRx, probeGlobalNetTx, filteredProbeGroups, probeCountryStats, currentFilter,
