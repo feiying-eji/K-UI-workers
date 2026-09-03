@@ -467,6 +467,7 @@ async function parseThirdPartySubscription(content) {
 
 let schemaReadyPromise = null;
 let lastReceiptCleanup = 0;
+let schemaVersionChecked = 0; // 缓存 schema 版本检查，避免每次冷启动都跑全部 DDL
 
 function loginThrottleKey(request) { return `${request.headers.get('CF-Connecting-IP') || 'unknown'}:${String(request.headers.get('Authorization') || '').split('.')[0].slice(0, 128)}`; }
 
@@ -484,8 +485,11 @@ async function recordLoginFailure(db, request) {
     await db.prepare('INSERT INTO login_throttles (key, failures, window_started_at, blocked_until) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET failures = excluded.failures, window_started_at = excluded.window_started_at, blocked_until = excluded.blocked_until').bind(key, failures, freshWindow ? now : row.window_started_at, blockedUntil).run();
 }
 
+// 优化版：用 PRAGMA table_info 一次性获取列名集合，避免逐列 SELECT 检查
+// 用 db.batch() 批量执行所有 CREATE TABLE，从 40+ 次查询压缩到 ~8 次
 async function initializeDbSchema(db) {
-    const initQueries = [
+    // 第 1 批：所有 CREATE TABLE IF NOT EXISTS（批量执行，1 次 D1 调用）
+    const createQueries = [
         `CREATE TABLE IF NOT EXISTS servers (ip TEXT PRIMARY KEY, name TEXT NOT NULL, cpu INTEGER DEFAULT 0, mem REAL DEFAULT 0, last_report INTEGER DEFAULT 0, alert_sent INTEGER DEFAULT 0, disk INTEGER DEFAULT 0, load TEXT DEFAULT "", uptime TEXT DEFAULT "", net_in_speed INTEGER DEFAULT 0, net_out_speed INTEGER DEFAULT 0, tcp_conn INTEGER DEFAULT 0, udp_conn INTEGER DEFAULT 0)`,
         `CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT NOT NULL, traffic_limit INTEGER DEFAULT 0, traffic_used INTEGER DEFAULT 0, expire_time INTEGER DEFAULT 0, enable INTEGER DEFAULT 1, sub_token TEXT)`,
         `CREATE TABLE IF NOT EXISTS nodes (id TEXT PRIMARY KEY, uuid TEXT NOT NULL, vps_ip TEXT NOT NULL, protocol TEXT NOT NULL, port INTEGER NOT NULL, sni TEXT, private_key TEXT, public_key TEXT, short_id TEXT, relay_type TEXT, target_ip TEXT, target_port INTEGER, target_id TEXT, enable INTEGER DEFAULT 1, traffic_used INTEGER DEFAULT 0, traffic_limit INTEGER DEFAULT 0, expire_time INTEGER DEFAULT 0, username TEXT DEFAULT 'admin', network TEXT DEFAULT 'tcp', FOREIGN KEY(vps_ip) REFERENCES servers(ip) ON DELETE CASCADE)`,
@@ -503,80 +507,51 @@ async function initializeDbSchema(db) {
         `CREATE TABLE IF NOT EXISTS user_group_members (group_id TEXT NOT NULL, username TEXT NOT NULL, PRIMARY KEY(group_id, username), FOREIGN KEY(group_id) REFERENCES user_groups(id) ON DELETE CASCADE, FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE)`,
         `CREATE TABLE IF NOT EXISTS user_group_resources (group_id TEXT NOT NULL, resource_type TEXT NOT NULL CHECK(resource_type IN ('vps', 'node')), resource_id TEXT NOT NULL, PRIMARY KEY(group_id, resource_type, resource_id), FOREIGN KEY(group_id) REFERENCES user_groups(id) ON DELETE CASCADE)`,
         `CREATE INDEX IF NOT EXISTS idx_group_members_user ON user_group_members(username)`,
-        `CREATE INDEX IF NOT EXISTS idx_group_resources_resource ON user_group_resources(resource_type, resource_id)`
-    ];
-    for (let query of initQueries) { try { await db.prepare(query).run(); } catch (e) {} }
-    try { await db.prepare("ALTER TABLE nodes ADD COLUMN network TEXT DEFAULT 'tcp'").run(); } catch (e) {}
-    try { await db.prepare("UPDATE nodes SET network = 'http' WHERE protocol = 'H2-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
-    try { await db.prepare("UPDATE nodes SET network = 'grpc' WHERE protocol = 'gRPC-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')").run(); } catch (e) {}
-
-    const probeQueries = [
+        `CREATE INDEX IF NOT EXISTS idx_group_resources_resource ON user_group_resources(resource_type, resource_id)`,
         `CREATE TABLE IF NOT EXISTS probe_settings (key TEXT PRIMARY KEY, value TEXT)`,
-        `CREATE TABLE IF NOT EXISTS probe_servers (
-            id TEXT PRIMARY KEY, name TEXT, cpu TEXT, ram TEXT, disk TEXT, load_avg TEXT, uptime TEXT, last_updated INTEGER,
-            ram_total TEXT, net_rx TEXT, net_tx TEXT, net_in_speed TEXT, net_out_speed TEXT,
-            os TEXT, cpu_info TEXT, arch TEXT, boot_time TEXT, ram_used TEXT, swap_total TEXT, 
-            swap_used TEXT, disk_total TEXT, disk_used TEXT, processes TEXT, tcp_conn TEXT, udp_conn TEXT, 
-            country TEXT, ip_v4 TEXT, ip_v6 TEXT, server_group TEXT DEFAULT '默认分组', price TEXT DEFAULT '', 
-            expire_date TEXT DEFAULT '', bandwidth TEXT DEFAULT '', traffic_limit TEXT DEFAULT '', agent_os TEXT DEFAULT 'debian',
-            ping_ct TEXT DEFAULT '0', ping_cu TEXT DEFAULT '0', ping_cm TEXT DEFAULT '0', ping_bd TEXT DEFAULT '0',
-            monthly_rx TEXT DEFAULT '0', monthly_tx TEXT DEFAULT '0', last_rx TEXT DEFAULT '0', last_tx TEXT DEFAULT '0', 
-            reset_month TEXT DEFAULT '', history TEXT DEFAULT '{}', is_hidden TEXT DEFAULT 'false', virt TEXT DEFAULT '',             reset_day TEXT DEFAULT '1'
-        )`,
-        `CREATE TABLE IF NOT EXISTS proxy_servers (ip TEXT PRIMARY KEY, socks_ip TEXT, port INTEGER, user TEXT, pass TEXT, country TEXT DEFAULT '', enabled INTEGER DEFAULT 1, last_seen INTEGER)`
-    ];
-    for (let query of probeQueries) { try { await db.prepare(query).run(); } catch (e) {} }
-
-    try { await db.prepare("SELECT username FROM nodes LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE nodes ADD COLUMN username TEXT DEFAULT 'admin'").run(); } catch(e){} }
-    try { await db.prepare("SELECT disk FROM servers LIMIT 1").first(); } catch (e) { const newCols = ['disk INTEGER DEFAULT 0', 'load TEXT DEFAULT ""', 'uptime TEXT DEFAULT ""', 'net_in_speed INTEGER DEFAULT 0', 'net_out_speed INTEGER DEFAULT 0', 'tcp_conn INTEGER DEFAULT 0', 'udp_conn INTEGER DEFAULT 0']; for (let col of newCols) { try { await db.prepare(`ALTER TABLE servers ADD COLUMN ${col}`).run(); } catch(err){} } }
-    try { await db.prepare("SELECT sub_token FROM users LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE users ADD COLUMN sub_token TEXT").run(); } catch(err){} }
-    try {
-        const { results: usersWithoutToken } = await db.prepare("SELECT username FROM users WHERE sub_token IS NULL OR sub_token = '' LIMIT 100").all();
-        if (usersWithoutToken && usersWithoutToken.length) await db.batch(usersWithoutToken.map(user => db.prepare("UPDATE users SET sub_token = ? WHERE username = ? AND (sub_token IS NULL OR sub_token = '')").bind(crypto.randomUUID(), user.username)));
-    } catch (error) {}
-    try { await db.prepare("SELECT reset_day FROM probe_servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE probe_servers ADD COLUMN reset_day TEXT DEFAULT '1'").run(); } catch(e){} }
-    try { await db.prepare("SELECT socks5_enable FROM servers LIMIT 1").first(); } catch (e) { const s5Cols = ['socks5_enable INTEGER DEFAULT 0', 'socks5_addr TEXT DEFAULT ""', 'socks5_port INTEGER DEFAULT 0', 'socks5_user TEXT DEFAULT ""', 'socks5_pass TEXT DEFAULT ""']; for (let col of s5Cols) { try { await db.prepare(`ALTER TABLE servers ADD COLUMN ${col}`).run(); } catch(err){} } }
-    try { await db.prepare("SELECT socks5_mode FROM servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE servers ADD COLUMN socks5_mode TEXT DEFAULT 'global'").run(); } catch(err){} try { await db.prepare("ALTER TABLE servers ADD COLUMN socks5_domains TEXT DEFAULT ''").run(); } catch(err){} }
-    try { await db.prepare("SELECT agent_token FROM servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE servers ADD COLUMN agent_token TEXT").run(); } catch(err){} }
-    const ensureWarpColumn = async (name, definition) => { try { await db.prepare(`SELECT ${name} FROM servers LIMIT 1`).first(); } catch (error) { try { await db.prepare(`ALTER TABLE servers ADD COLUMN ${name} ${definition}`).run(); } catch (alterError) { if (!/duplicate column/i.test(String(alterError?.message || alterError))) throw alterError; } } };
-    await ensureWarpColumn('warp_mode', "TEXT NOT NULL DEFAULT 'off'");
-    await ensureWarpColumn('warp_applied_mode', "TEXT NOT NULL DEFAULT 'off'");
-    await ensureWarpColumn('warp_revision', 'INTEGER NOT NULL DEFAULT 0');
-    await ensureWarpColumn('warp_applied_revision', 'INTEGER NOT NULL DEFAULT 0');
-    await ensureWarpColumn('warp_status', "TEXT NOT NULL DEFAULT 'off'");
-    await ensureWarpColumn('warp_error', "TEXT NOT NULL DEFAULT ''");
-    await ensureWarpColumn('warp_applied_at', 'INTEGER NOT NULL DEFAULT 0');
-    await ensureWarpColumn('egress_pending', "TEXT NOT NULL DEFAULT ''");
-    await ensureWarpColumn('egress_mode', "TEXT NOT NULL DEFAULT 'native'");
-    await ensureWarpColumn('egress_applied_mode', "TEXT NOT NULL DEFAULT 'native'");
-    await ensureWarpColumn('egress_revision', 'INTEGER NOT NULL DEFAULT 0');
-    await ensureWarpColumn('egress_applied_revision', 'INTEGER NOT NULL DEFAULT 0');
-    await ensureWarpColumn('egress_status', "TEXT NOT NULL DEFAULT 'applied'");
-    await ensureWarpColumn('egress_error', "TEXT NOT NULL DEFAULT ''");
-    await ensureWarpColumn('egress_applied_at', 'INTEGER NOT NULL DEFAULT 0');
-    try { await db.prepare("SELECT proxy_mode FROM servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE servers ADD COLUMN proxy_mode TEXT DEFAULT 'global'").run(); } catch(err){} }
-    try { await db.prepare("SELECT proxy_categories FROM servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE servers ADD COLUMN proxy_categories TEXT DEFAULT ''").run(); } catch(err){} }
-    try { await db.prepare("SELECT egress_ip FROM servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE servers ADD COLUMN egress_ip TEXT DEFAULT ''").run(); } catch(err){} }
-    try { await db.prepare("SELECT last_report_id FROM probe_servers LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE probe_servers ADD COLUMN last_report_id TEXT DEFAULT ''").run(); } catch(err){} }
-    try { await db.prepare("SELECT applied FROM report_receipts LIMIT 1").first(); } catch (e) { try { await db.prepare("ALTER TABLE report_receipts ADD COLUMN applied INTEGER DEFAULT 1").run(); } catch(err){} }
-
-    // 初始化云端测速数据
-    const checkNodes = await db.prepare("SELECT value FROM probe_settings WHERE key = 'cached_nodes_data'").first();
-    if (!checkNodes) {
-        try {
-            const res = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json');
-            if (res.ok) {
-                const dataText = await res.text();
-                await db.prepare("INSERT INTO probe_settings (key, value) VALUES ('cached_nodes_data', ?)").bind(dataText).run();
-            }
-        } catch(e) {}
-    }
-
-    const tpsQueries = [
+        `CREATE TABLE IF NOT EXISTS probe_servers (id TEXT PRIMARY KEY, name TEXT, cpu TEXT, ram TEXT, disk TEXT, load_avg TEXT, uptime TEXT, last_updated INTEGER, ram_total TEXT, net_rx TEXT, net_tx TEXT, net_in_speed TEXT, net_out_speed TEXT, os TEXT, cpu_info TEXT, arch TEXT, boot_time TEXT, ram_used TEXT, swap_total TEXT, swap_used TEXT, disk_total TEXT, disk_used TEXT, processes TEXT, tcp_conn TEXT, udp_conn TEXT, country TEXT, ip_v4 TEXT, ip_v6 TEXT, server_group TEXT DEFAULT '默认分组', price TEXT DEFAULT '', expire_date TEXT DEFAULT '', bandwidth TEXT DEFAULT '', traffic_limit TEXT DEFAULT '', agent_os TEXT DEFAULT 'debian', ping_ct TEXT DEFAULT '0', ping_cu TEXT DEFAULT '0', ping_cm TEXT DEFAULT '0', ping_bd TEXT DEFAULT '0', monthly_rx TEXT DEFAULT '0', monthly_tx TEXT DEFAULT '0', last_rx TEXT DEFAULT '0', last_tx TEXT DEFAULT '0', reset_month TEXT DEFAULT '', history TEXT DEFAULT '{}', is_hidden TEXT DEFAULT 'false', virt TEXT DEFAULT '', reset_day TEXT DEFAULT '1')`,
+        `CREATE TABLE IF NOT EXISTS proxy_servers (ip TEXT PRIMARY KEY, socks_ip TEXT, port INTEGER, user TEXT, pass TEXT, country TEXT DEFAULT '', enabled INTEGER DEFAULT 1, last_seen INTEGER)`,
         `CREATE TABLE IF NOT EXISTS third_party_subscriptions (id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL, is_enable INTEGER DEFAULT 1, added_at INTEGER, last_fetched_at INTEGER)`,
         `CREATE TABLE IF NOT EXISTS third_party_nodes (id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL, name TEXT, protocol TEXT NOT NULL, address TEXT NOT NULL, port INTEGER NOT NULL, uuid TEXT, password TEXT, sni TEXT, public_key TEXT, short_id TEXT, flow TEXT, network TEXT, host TEXT, path TEXT, extra TEXT, enable INTEGER DEFAULT 1, created_at INTEGER, FOREIGN KEY(subscription_id) REFERENCES third_party_subscriptions(id) ON DELETE CASCADE)`
     ];
-    for (let query of tpsQueries) { try { await db.prepare(query).run(); } catch (e) {} }
+    try { await db.batch(createQueries.map(q => db.prepare(q))); } catch (e) {}
+
+    // 第 2 步：用 PRAGMA table_info 一次性获取 servers 表列名（1 次查询代替 ~25 次 SELECT LIMIT 1）
+    const serverCols = new Set();
+    try { const { results: cols } = await db.prepare("PRAGMA table_info(servers)").all(); if (cols) for (const c of cols) serverCols.add(c.name); } catch (e) {}
+    const serverNewCols = [['disk','INTEGER DEFAULT 0'],['load','TEXT DEFAULT ""'],['uptime','TEXT DEFAULT ""'],['net_in_speed','INTEGER DEFAULT 0'],['net_out_speed','INTEGER DEFAULT 0'],['tcp_conn','INTEGER DEFAULT 0'],['udp_conn','INTEGER DEFAULT 0'],['socks5_enable','INTEGER DEFAULT 0'],['socks5_addr','TEXT DEFAULT ""'],['socks5_port','INTEGER DEFAULT 0'],['socks5_user','TEXT DEFAULT ""'],['socks5_pass','TEXT DEFAULT ""'],['socks5_mode',"TEXT DEFAULT 'global'"],['socks5_domains',"TEXT DEFAULT ''"],['agent_token','TEXT'],['warp_mode',"TEXT NOT NULL DEFAULT 'off'"],['warp_applied_mode',"TEXT NOT NULL DEFAULT 'off'"],['warp_revision','INTEGER NOT NULL DEFAULT 0'],['warp_applied_revision','INTEGER NOT NULL DEFAULT 0'],['warp_status',"TEXT NOT NULL DEFAULT 'off'"],['warp_error',"TEXT NOT NULL DEFAULT ''"],['warp_applied_at','INTEGER NOT NULL DEFAULT 0'],['egress_pending',"TEXT NOT NULL DEFAULT ''"],['egress_mode',"TEXT NOT NULL DEFAULT 'native'"],['egress_applied_mode',"TEXT NOT NULL DEFAULT 'native'"],['egress_revision','INTEGER NOT NULL DEFAULT 0'],['egress_applied_revision','INTEGER NOT NULL DEFAULT 0'],['egress_status',"TEXT NOT NULL DEFAULT 'applied'"],['egress_error',"TEXT NOT NULL DEFAULT ''"],['egress_applied_at','INTEGER NOT NULL DEFAULT 0'],['proxy_mode',"TEXT DEFAULT 'global'"],['proxy_categories',"TEXT DEFAULT ''"],['egress_ip',"TEXT DEFAULT ''"]];
+    const serverAlterStmts = serverNewCols.filter(([name]) => !serverCols.has(name)).map(([name, def]) => db.prepare(`ALTER TABLE servers ADD COLUMN ${name} ${def}`));
+    if (serverAlterStmts.length) { try { await db.batch(serverAlterStmts); } catch (e) {} }
+
+    // 第 3 步：检查 nodes 表列（1 次 PRAGMA 代替 2 次 SELECT）
+    const nodeCols = new Set();
+    try { const { results: cols } = await db.prepare("PRAGMA table_info(nodes)").all(); if (cols) for (const c of cols) nodeCols.add(c.name); } catch (e) {}
+    const nodeAlterStmts = [];
+    if (!nodeCols.has('network')) nodeAlterStmts.push(db.prepare("ALTER TABLE nodes ADD COLUMN network TEXT DEFAULT 'tcp'"));
+    if (!nodeCols.has('username')) nodeAlterStmts.push(db.prepare("ALTER TABLE nodes ADD COLUMN username TEXT DEFAULT 'admin'"));
+    if (nodeAlterStmts.length) { try { await db.batch(nodeAlterStmts); } catch (e) {} }
+    try { await db.batch([db.prepare("UPDATE nodes SET network = 'http' WHERE protocol = 'H2-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')"), db.prepare("UPDATE nodes SET network = 'grpc' WHERE protocol = 'gRPC-Reality' AND (network IS NULL OR network = '' OR network = 'tcp')")]); } catch (e) {}
+
+    // 第 4 步：检查 users 表列
+    const userCols = new Set();
+    try { const { results: cols } = await db.prepare("PRAGMA table_info(users)").all(); if (cols) for (const c of cols) userCols.add(c.name); } catch (e) {}
+    if (!userCols.has('sub_token')) { try { await db.prepare("ALTER TABLE users ADD COLUMN sub_token TEXT").run(); } catch(e){} }
+    try { const { results: usersWithoutToken } = await db.prepare("SELECT username FROM users WHERE sub_token IS NULL OR sub_token = '' LIMIT 100").all(); if (usersWithoutToken && usersWithoutToken.length) await db.batch(usersWithoutToken.map(user => db.prepare("UPDATE users SET sub_token = ? WHERE username = ? AND (sub_token IS NULL OR sub_token = '')").bind(crypto.randomUUID(), user.username))); } catch (error) {}
+
+    // 第 5 步：检查 probe_servers 和 report_receipts 表列
+    const probeCols = new Set();
+    try { const { results: cols } = await db.prepare("PRAGMA table_info(probe_servers)").all(); if (cols) for (const c of cols) probeCols.add(c.name); } catch (e) {}
+    const probeAlterStmts = [];
+    if (!probeCols.has('reset_day')) probeAlterStmts.push(db.prepare("ALTER TABLE probe_servers ADD COLUMN reset_day TEXT DEFAULT '1'"));
+    if (!probeCols.has('last_report_id')) probeAlterStmts.push(db.prepare("ALTER TABLE probe_servers ADD COLUMN last_report_id TEXT DEFAULT ''"));
+    if (probeAlterStmts.length) { try { await db.batch(probeAlterStmts); } catch (e) {} }
+    const receiptCols = new Set();
+    try { const { results: cols } = await db.prepare("PRAGMA table_info(report_receipts)").all(); if (cols) for (const c of cols) receiptCols.add(c.name); } catch (e) {}
+    if (!receiptCols.has('applied')) { try { await db.prepare("ALTER TABLE report_receipts ADD COLUMN applied INTEGER DEFAULT 1").run(); } catch(err){} }
+
+    // 初始化云端测速数据（仅在首次部署时）
+    const checkNodes = await db.prepare("SELECT value FROM probe_settings WHERE key = 'cached_nodes_data'").first();
+    if (!checkNodes) { try { const res = await fetch('https://raw.githubusercontent.com/a63414262/CF-Server-Monitor-Pro/refs/heads/main/nodes.json'); if (res.ok) { const dataText = await res.text(); await db.prepare("INSERT INTO probe_settings (key, value) VALUES ('cached_nodes_data', ?)").bind(dataText).run(); } } catch(e) {} }
 }
 
 async function ensureDbSchema(db) {
@@ -705,6 +680,16 @@ async function handleProbeAPI(request, env, context, pathArray) {
     }
 
     if (method === 'GET' && subPath === 'public') {
+        // IP 限流：每 IP 每 60 秒最多 10 次请求，用 Cache API 做轻量计数器（不消耗 D1）
+        const clientIp = request.headers.get('CF-Connecting-IP') || 'unknown';
+        const rateLimitKey = new Request(`https://rate-limit.internal/probe-public/${clientIp}`);
+        const rateLimitEntry = await caches.default.match(rateLimitKey);
+        let count = 0; let firstReq = Date.now();
+        if (rateLimitEntry) { try { const data = await rateLimitEntry.json(); count = data.count || 0; firstReq = data.firstReq || Date.now(); } catch(e){} }
+        if (Date.now() - firstReq > 60000) { count = 0; firstReq = Date.now(); }
+        count++;
+        if (count > 10) return Response.json({ error: "Too many requests, please wait 60 seconds." }, { status: 429, headers: { 'Retry-After': '60', 'Cache-Control': 'no-store' } });
+        context.waitUntil(caches.default.put(rateLimitKey, new Response(JSON.stringify({ count, firstReq }), { headers: { 'Cache-Control': 'max-age=60' } })));
         const isAjax = url.searchParams.get('ajax') === '1';
         const cacheKey = new Request(`${url.origin}/api/probe/public?ajax=${isAjax ? '1' : '0'}`);
         const cached = await caches.default.match(cacheKey);
@@ -1744,3 +1729,4 @@ rules:
 export async function onRequestScheduled(context) {
     try { await checkOfflineServers(context.env); } catch (error) { console.error('[cron] offline check failed:', error); throw error; }
 }
+
