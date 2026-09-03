@@ -1,14 +1,14 @@
-{
+﻿{
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "kui",
   "main": "src/worker.js",
   "compatibility_date": "2026-07-15",
-  "workers_dev": true,
-  "vars": {
+  "workers_dev": false,
+    "vars": {
     "ADMIN_USERNAME": "admin",
-    "ADMIN_PASSWORD": "admin",
+    "ADMIN_PASSWORD": "USE_WRANGLER_SECRET_PUT",
     "PROXY_USER": "kui",
-    "PROXY_PASS": "kui"
+    "PROXY_PASS": "USE_WRANGLER_SECRET_PUT"
   },
   "assets": {
     "directory": "static",
@@ -40,3 +40,4 @@
     "head_sampling_rate": 0.1
   }
 }
+
